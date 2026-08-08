@@ -6847,57 +6847,51 @@ body.sas-view-cards .tbl-hd{margin:0 14px;border-radius:10px}
 }
 </style>
 <!-- ============================================================
-     RLS TOKEN-EXCHANGE PATCH v2  (SANDBOX TEST BUILD)
-     Version-proof approach: instead of supabase-js's `accessToken` option
-     (which varies by minor version), we override the client's `fetch` so
-     every request's Authorization header carries the per-user minted token.
-     Fails CLOSED: no token -> anon -> RLS returns nothing.
-     SANDBOX ONLY.
+     RLS TOKEN-EXCHANGE PATCH v3  (SANDBOX TEST BUILD)
+     Most robust approach: wrap supabase.createClient ITSELF so EVERY client
+     the app ever creates (via getSB, direct, or realtime) is born with a
+     fetch that swaps in the per-user minted token. No reliance on overriding
+     getSB or on the accessToken option. Fails CLOSED.  SANDBOX ONLY.
      ============================================================ -->
 <script>
 (function(){
   "use strict";
   var EXCHANGE_URL = SB_URL + "/functions/v1/exchange-jwt";
-
   var _sbJwt = null, _sbJwtExp = 0, _inflight = null;
 
   function _decodeExp(jwt){
     try { var p = JSON.parse(atob(jwt.split(".")[1].replace(/-/g,"+").replace(/_/g,"/"))); return p.exp ? p.exp*1000 : 0; }
     catch(e){ return 0; }
   }
-
   async function _getIdToken(){
     if (typeof getMsal !== "function") return null;
-    var instance; try { instance = await getMsal(); } catch(e){ return null; }
-    if (!instance) return null;
-    var account = (instance.getActiveAccount && instance.getActiveAccount())
-               || (instance.getAllAccounts && instance.getAllAccounts()[0]) || null;
-    if (!account) return null;
+    var inst; try { inst = await getMsal(); } catch(e){ return null; }
+    if (!inst) return null;
+    var acct = (inst.getActiveAccount && inst.getActiveAccount())
+            || (inst.getAllAccounts && inst.getAllAccounts()[0]) || null;
+    if (!acct) return null;
     try {
-      var res = await instance.acquireTokenSilent({
-        account: account,
+      var res = await inst.acquireTokenSilent({
+        account: acct,
         scopes: (typeof loginRequest !== "undefined" && loginRequest.scopes) || ["openid","profile","email"]
       });
       return res.idToken || null;
     } catch(e){ console.warn("[rls] acquireTokenSilent failed", e); return null; }
   }
-
   async function _getSupabaseJwt(){
     var now = Date.now();
     if (_sbJwt && now < _sbJwtExp) return _sbJwt;
     if (_inflight) return _inflight;
     _inflight = (async function(){
       try {
-        var idToken = await _getIdToken();
-        if (!idToken) return null;
-        var r = await fetch(EXCHANGE_URL, {
-          method:"POST",
-          headers:{ "Authorization":"Bearer "+idToken, "apikey":SB_KEY, "Content-Type":"application/json" }
-        });
+        var idt = await _getIdToken();
+        if (!idt) return null;
+        var r = await fetch(EXCHANGE_URL, { method:"POST",
+          headers:{ "Authorization":"Bearer "+idt, "apikey":SB_KEY, "Content-Type":"application/json" }});
         if (!r.ok){ console.warn("[rls] exchange HTTP", r.status); return null; }
-        var body = await r.json();
-        if (!body || !body.supabaseJwt) return null;
-        _sbJwt = body.supabaseJwt;
+        var b = await r.json();
+        if (!b || !b.supabaseJwt) return null;
+        _sbJwt = b.supabaseJwt;
         var exp = _decodeExp(_sbJwt);
         _sbJwtExp = exp ? (exp - 10*60*1000) : (now + 50*60*1000);
         return _sbJwt;
@@ -6906,46 +6900,47 @@ body.sas-view-cards .tbl-hd{margin:0 14px;border-radius:10px}
     })();
     return _inflight;
   }
-
   window.clearSupabaseTokenCache = function(){ _sbJwt = null; _sbJwtExp = 0; };
+  window.__rlsGetJwt = _getSupabaseJwt; // for manual testing
 
-  // Custom fetch: swaps the Authorization bearer with the minted per-user token
-  // for all calls to the Supabase REST/RPC/storage endpoints. The call to the
-  // exchange function itself must NOT be rewritten (it needs the MS token),
-  // but the client never calls the function, so this is naturally safe.
-  async function _tokenFetch(input, init){
-    init = init || {};
-    var url = (typeof input === "string") ? input : (input && input.url) || "";
-    // only rewrite calls to our Supabase project REST/realtime/storage
-    if (url.indexOf(SB_URL) === 0 && url.indexOf("/functions/v1/exchange-jwt") === -1) {
-      var jwt = await _getSupabaseJwt();
-      if (jwt) {
-        // normalize headers to a plain object we can edit
-        var h = new Headers((init && init.headers) || (typeof input!=="string" && input.headers) || {});
-        h.set("Authorization", "Bearer " + jwt);
-        h.set("apikey", SB_KEY);
-        init = Object.assign({}, init, { headers: h });
+  function _makeTokenFetch(baseFetch){
+    return async function(input, init){
+      init = init || {};
+      var url = (typeof input === "string") ? input : (input && input.url) || "";
+      if (url.indexOf(SB_URL) === 0 && url.indexOf("/functions/v1/exchange-jwt") === -1) {
+        var jwt = await _getSupabaseJwt();
+        if (jwt) {
+          var h = new Headers((init && init.headers) || (typeof input!=="string" && input.headers) || {});
+          h.set("Authorization", "Bearer " + jwt);
+          h.set("apikey", SB_KEY);
+          init = Object.assign({}, init, { headers: h });
+          if (typeof input !== "string" && input.url) {
+            // rebuild Request so overridden headers take effect
+            input = new Request(input.url, Object.assign({
+              method: input.method, body: input.body, mode: input.mode,
+              credentials: input.credentials, cache: input.cache, redirect: input.redirect,
+              referrer: input.referrer, integrity: input.integrity
+            }, { headers: h }));
+          }
+        }
       }
-      // if no jwt: leave as-is (anon) -> RLS returns nothing (fail closed)
-    }
-    return fetch(input, init);
+      return (baseFetch || fetch)(input, init);
+    };
   }
 
-  if (typeof getSB === "function") {
-    var _client = null;
-    window.getSB = function(){
-      if (_client) return _client;
-      if (typeof supabase === "undefined") return null;
-      _client = supabase.createClient(SB_URL, SB_KEY, {
-        auth: { autoRefreshToken:false, persistSession:false },
-        global: { fetch: _tokenFetch }
-      });
-      return _client;
+  if (window.supabase && typeof window.supabase.createClient === "function") {
+    var _origCreate = window.supabase.createClient.bind(window.supabase);
+    window.supabase.createClient = function(url, key, opts){
+      opts = opts || {};
+      opts.global = opts.global || {};
+      var base = opts.global.fetch; // respect any existing fetch
+      opts.global.fetch = _makeTokenFetch(base);
+      if (!opts.auth) opts.auth = { autoRefreshToken:false, persistSession:false };
+      return _origCreate(url, key, opts);
     };
-    try { if (typeof sb !== "undefined") sb = null; } catch(e){}
-    console.log("[rls] token-exchange patch v2 active (SANDBOX) — fetch-level token swap.");
+    console.log("[rls] token-exchange patch v3 active (SANDBOX) — createClient wrapped; every client swaps tokens.");
   } else {
-    console.error("[rls] getSB not found — patch could not attach.");
+    console.error("[rls] supabase.createClient not found — patch could not attach.");
   }
 })();
 </script>
