@@ -6847,116 +6847,103 @@ body.sas-view-cards .tbl-hd{margin:0 14px;border-radius:10px}
 }
 </style>
 <!-- ============================================================
-     RLS TOKEN-EXCHANGE PATCH  (SANDBOX TEST BUILD)
-     Makes every Supabase request carry a per-user token minted from the
-     signed-in Microsoft user, instead of the shared anon key. This is what
-     lets Row-Level Security identify the user.
-
-     Approach: override getSB() so the supabase-js client is created ONCE with
-     the v2 `accessToken` option. That option fetches a fresh Microsoft ID
-     token via the app's existing getMsal() instance, exchanges it at the
-     exchange-jwt Edge Function for a Supabase-signed JWT, and caches it (~50m).
-
-     Fails CLOSED: if no valid token can be obtained, the request goes out with
-     no user token and RLS returns nothing (empty) rather than leaking data.
-
-     SANDBOX ONLY: points at the sandbox project. Do NOT ship to production as-is.
+     RLS TOKEN-EXCHANGE PATCH v2  (SANDBOX TEST BUILD)
+     Version-proof approach: instead of supabase-js's `accessToken` option
+     (which varies by minor version), we override the client's `fetch` so
+     every request's Authorization header carries the per-user minted token.
+     Fails CLOSED: no token -> anon -> RLS returns nothing.
+     SANDBOX ONLY.
      ============================================================ -->
 <script>
 (function(){
   "use strict";
-
   var EXCHANGE_URL = SB_URL + "/functions/v1/exchange-jwt";
 
-  // --- token cache -------------------------------------------------------
-  var _sbJwt = null;
-  var _sbJwtExp = 0;          // epoch ms when our cached Supabase JWT should be refreshed
-  var _inflight = null;       // de-dupe concurrent exchanges
+  var _sbJwt = null, _sbJwtExp = 0, _inflight = null;
 
   function _decodeExp(jwt){
-    try {
-      var p = JSON.parse(atob(jwt.split(".")[1].replace(/-/g,"+").replace(/_/g,"/")));
-      return (p.exp ? p.exp*1000 : 0);
-    } catch(e){ return 0; }
+    try { var p = JSON.parse(atob(jwt.split(".")[1].replace(/-/g,"+").replace(/_/g,"/"))); return p.exp ? p.exp*1000 : 0; }
+    catch(e){ return 0; }
   }
 
-  // Get a fresh Microsoft ID token from the app's existing MSAL instance.
   async function _getIdToken(){
     if (typeof getMsal !== "function") return null;
-    var instance;
-    try { instance = await getMsal(); } catch(e){ console.warn("[rls] getMsal failed", e); return null; }
+    var instance; try { instance = await getMsal(); } catch(e){ return null; }
     if (!instance) return null;
     var account = (instance.getActiveAccount && instance.getActiveAccount())
-               || (instance.getAllAccounts && instance.getAllAccounts()[0])
-               || null;
+               || (instance.getAllAccounts && instance.getAllAccounts()[0]) || null;
     if (!account) return null;
     try {
-      // silent: uses cached/refresh tokens; returns a FRESH id token
       var res = await instance.acquireTokenSilent({
         account: account,
         scopes: (typeof loginRequest !== "undefined" && loginRequest.scopes) || ["openid","profile","email"]
       });
       return res.idToken || null;
-    } catch(e){
-      console.warn("[rls] acquireTokenSilent failed (user may need to re-login)", e);
-      return null;
-    }
+    } catch(e){ console.warn("[rls] acquireTokenSilent failed", e); return null; }
   }
 
-  // Exchange the MS ID token for a Supabase JWT (cached).
   async function _getSupabaseJwt(){
     var now = Date.now();
-    if (_sbJwt && now < _sbJwtExp) return _sbJwt;      // cache hit
-    if (_inflight) return _inflight;                    // join in-flight call
-
+    if (_sbJwt && now < _sbJwtExp) return _sbJwt;
+    if (_inflight) return _inflight;
     _inflight = (async function(){
       try {
         var idToken = await _getIdToken();
         if (!idToken) return null;
         var r = await fetch(EXCHANGE_URL, {
-          method: "POST",
-          headers: { "Authorization": "Bearer " + idToken, "apikey": SB_KEY, "Content-Type": "application/json" }
+          method:"POST",
+          headers:{ "Authorization":"Bearer "+idToken, "apikey":SB_KEY, "Content-Type":"application/json" }
         });
-        if (!r.ok){ console.warn("[rls] exchange-jwt HTTP", r.status); return null; }
+        if (!r.ok){ console.warn("[rls] exchange HTTP", r.status); return null; }
         var body = await r.json();
         if (!body || !body.supabaseJwt) return null;
         _sbJwt = body.supabaseJwt;
         var exp = _decodeExp(_sbJwt);
-        // refresh 10 min before actual expiry (or in 50 min if exp missing)
         _sbJwtExp = exp ? (exp - 10*60*1000) : (now + 50*60*1000);
         return _sbJwt;
-      } catch(e){
-        console.error("[rls] exchange error", e);
-        return null;
-      } finally {
-        _inflight = null;
-      }
+      } catch(e){ console.error("[rls] exchange error", e); return null; }
+      finally { _inflight = null; }
     })();
     return _inflight;
   }
 
-  // Expose a manual cache-clear (call on logout).
   window.clearSupabaseTokenCache = function(){ _sbJwt = null; _sbJwtExp = 0; };
 
-  // --- override getSB() to build the client with the accessToken hook -----
+  // Custom fetch: swaps the Authorization bearer with the minted per-user token
+  // for all calls to the Supabase REST/RPC/storage endpoints. The call to the
+  // exchange function itself must NOT be rewritten (it needs the MS token),
+  // but the client never calls the function, so this is naturally safe.
+  async function _tokenFetch(input, init){
+    init = init || {};
+    var url = (typeof input === "string") ? input : (input && input.url) || "";
+    // only rewrite calls to our Supabase project REST/realtime/storage
+    if (url.indexOf(SB_URL) === 0 && url.indexOf("/functions/v1/exchange-jwt") === -1) {
+      var jwt = await _getSupabaseJwt();
+      if (jwt) {
+        // normalize headers to a plain object we can edit
+        var h = new Headers((init && init.headers) || (typeof input!=="string" && input.headers) || {});
+        h.set("Authorization", "Bearer " + jwt);
+        h.set("apikey", SB_KEY);
+        init = Object.assign({}, init, { headers: h });
+      }
+      // if no jwt: leave as-is (anon) -> RLS returns nothing (fail closed)
+    }
+    return fetch(input, init);
+  }
+
   if (typeof getSB === "function") {
-    var _origSb = null;
+    var _client = null;
     window.getSB = function(){
-      if (_origSb) return _origSb;
+      if (_client) return _client;
       if (typeof supabase === "undefined") return null;
-      _origSb = supabase.createClient(SB_URL, SB_KEY, {
+      _client = supabase.createClient(SB_URL, SB_KEY, {
         auth: { autoRefreshToken:false, persistSession:false },
-        // supabase-js v2: called before each request; returns the token to use.
-        accessToken: async function(){
-          var t = await _getSupabaseJwt();
-          return t || null;   // null -> anon -> RLS returns nothing (fail closed)
-        }
+        global: { fetch: _tokenFetch }
       });
-      return _origSb;
+      return _client;
     };
-    // If the app already created a client into `sb`, drop it so ours is used.
     try { if (typeof sb !== "undefined") sb = null; } catch(e){}
-    console.log("[rls] token-exchange patch active (SANDBOX). getSB() now attaches per-user tokens.");
+    console.log("[rls] token-exchange patch v2 active (SANDBOX) — fetch-level token swap.");
   } else {
     console.error("[rls] getSB not found — patch could not attach.");
   }
