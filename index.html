@@ -6847,17 +6847,22 @@ body.sas-view-cards .tbl-hd{margin:0 14px;border-radius:10px}
 }
 </style>
 <!-- ============================================================
-     RLS TOKEN-EXCHANGE PATCH v3  (SANDBOX TEST BUILD)
-     Most robust approach: wrap supabase.createClient ITSELF so EVERY client
-     the app ever creates (via getSB, direct, or realtime) is born with a
-     fetch that swaps in the per-user minted token. No reliance on overriding
-     getSB or on the accessToken option. Fails CLOSED.  SANDBOX ONLY.
+     RLS TOKEN-EXCHANGE PATCH v4  (SANDBOX TEST BUILD)
+     Proven approach: bake the minted per-user JWT into the client's
+     global.headers at CREATION time (postgrest can't clobber a creation-time
+     Authorization header — verified live). getSB() returns the authed client
+     once the token is ready; until then it returns an anon client (fail-closed,
+     empty). On login / token-ready we rebuild the client and reload data.
+     SANDBOX ONLY.
      ============================================================ -->
 <script>
 (function(){
   "use strict";
   var EXCHANGE_URL = SB_URL + "/functions/v1/exchange-jwt";
   var _sbJwt = null, _sbJwtExp = 0, _inflight = null;
+  var _authedClient = null;      // client built WITH the token
+  var _anonClient = null;        // fallback client (no token) -> RLS empty
+  var _buildPromise = null;      // in-flight build (await instead of racing)
 
   function _decodeExp(jwt){
     try { var p = JSON.parse(atob(jwt.split(".")[1].replace(/-/g,"+").replace(/_/g,"/"))); return p.exp ? p.exp*1000 : 0; }
@@ -6878,7 +6883,7 @@ body.sas-view-cards .tbl-hd{margin:0 14px;border-radius:10px}
       return res.idToken || null;
     } catch(e){ console.warn("[rls] acquireTokenSilent failed", e); return null; }
   }
-  async function _getSupabaseJwt(){
+  async function _mintJwt(){
     var now = Date.now();
     if (_sbJwt && now < _sbJwtExp) return _sbJwt;
     if (_inflight) return _inflight;
@@ -6900,47 +6905,74 @@ body.sas-view-cards .tbl-hd{margin:0 14px;border-radius:10px}
     })();
     return _inflight;
   }
-  window.clearSupabaseTokenCache = function(){ _sbJwt = null; _sbJwtExp = 0; };
-  window.__rlsGetJwt = _getSupabaseJwt; // for manual testing
 
-  function _makeTokenFetch(baseFetch){
-    return async function(input, init){
-      init = init || {};
-      var url = (typeof input === "string") ? input : (input && input.url) || "";
-      if (url.indexOf(SB_URL) === 0 && url.indexOf("/functions/v1/exchange-jwt") === -1) {
-        var jwt = await _getSupabaseJwt();
-        if (jwt) {
-          var h = new Headers((init && init.headers) || (typeof input!=="string" && input.headers) || {});
-          h.set("Authorization", "Bearer " + jwt);
-          h.set("apikey", SB_KEY);
-          init = Object.assign({}, init, { headers: h });
-          if (typeof input !== "string" && input.url) {
-            // rebuild Request so overridden headers take effect
-            input = new Request(input.url, Object.assign({
-              method: input.method, body: input.body, mode: input.mode,
-              credentials: input.credentials, cache: input.cache, redirect: input.redirect,
-              referrer: input.referrer, integrity: input.integrity
-            }, { headers: h }));
-          }
-        }
-      }
-      return (baseFetch || fetch)(input, init);
-    };
+  function _makeClient(jwt){
+    var opts = { auth:{ autoRefreshToken:false, persistSession:false } };
+    if (jwt) opts.global = { headers: { Authorization: "Bearer " + jwt } };
+    return _origCreate(SB_URL, SB_KEY, opts);
   }
 
-  if (window.supabase && typeof window.supabase.createClient === "function") {
-    var _origCreate = window.supabase.createClient.bind(window.supabase);
-    window.supabase.createClient = function(url, key, opts){
-      opts = opts || {};
-      opts.global = opts.global || {};
-      var base = opts.global.fetch; // respect any existing fetch
-      opts.global.fetch = _makeTokenFetch(base);
-      if (!opts.auth) opts.auth = { autoRefreshToken:false, persistSession:false };
-      return _origCreate(url, key, opts);
+  var _origCreate = (window.supabase && window.supabase.createClient)
+    ? window.supabase.createClient.bind(window.supabase) : null;
+
+  // Build (or rebuild) the authed client, then reload the app's data.
+  // Dedupes concurrent callers onto one shared promise so an explicit
+  // ensure(true) awaits the same build a background getSB() kicked off.
+  function ensureAuthedClient(force){
+    if (_authedClient && !force) return Promise.resolve(_authedClient);
+    if (_buildPromise) return _buildPromise;
+    _buildPromise = (async function(){
+      try {
+        var jwt = await _mintJwt();
+        if (!jwt) return null;
+        _authedClient = _makeClient(jwt);
+        try { if (_authedClient.realtime && _authedClient.realtime.setAuth) _authedClient.realtime.setAuth(jwt); } catch(e){}
+        window.__rlsReady = true;
+        console.log("[rls] authed client ready — reloading data.");
+        try {
+          if (typeof dbLoad === "function") { await dbLoad(); }
+          if (typeof updateBadges === "function") updateBadges();
+          if (typeof renderView === "function") renderView();
+        } catch(e){ console.warn("[rls] post-auth reload issue", e); }
+        return _authedClient;
+      } finally { _buildPromise = null; }
+    })();
+    return _buildPromise;
+  }
+
+  // getSB(): return authed client if ready; else an anon client (fail-closed),
+  // and kick off building the authed one in the background.
+  if (typeof getSB === "function" && _origCreate) {
+    window.getSB = function(){
+      if (_authedClient) return _authedClient;
+      // start building (non-blocking) if we have a signed-in account
+      ensureAuthedClient();
+      if (!_anonClient) _anonClient = _makeClient(null);
+      return _anonClient;
     };
-    console.log("[rls] token-exchange patch v3 active (SANDBOX) — createClient wrapped; every client swaps tokens.");
+    try { if (typeof sb !== "undefined") sb = null; } catch(e){}
+
+    window.clearSupabaseTokenCache = function(){
+      _sbJwt = null; _sbJwtExp = 0; _authedClient = null; window.__rlsReady = false;
+    };
+    window.__rlsGetJwt = _mintJwt;
+    window.__rlsEnsure = ensureAuthedClient;
+
+    // Prime after login: wrap loginAs so the authed client builds right when
+    // a user is established, then data reloads with their token.
+    if (typeof loginAs === "function") {
+      var _origLoginAs = loginAs;
+      window.loginAs = function(id){
+        var r = _origLoginAs.apply(this, arguments);
+        // build authed client + reload once MSAL account is present
+        ensureAuthedClient(true);
+        return r;
+      };
+    }
+
+    console.log("[rls] token-exchange patch v4 active (SANDBOX) — creation-time header client.");
   } else {
-    console.error("[rls] supabase.createClient not found — patch could not attach.");
+    console.error("[rls] getSB or supabase.createClient not found — patch could not attach.");
   }
 })();
 </script>
